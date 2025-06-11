@@ -330,7 +330,7 @@ class CaptionProcessingDTOMixin:
             short_caption = None
 
             if os.path.exists(prompt_path):
-                print_acc(f"DEBUG: Found caption file {prompt_path}")
+                # print_acc(f"DEBUG: Found caption file {prompt_path}")
                 with open(prompt_path, 'r', encoding='utf-8') as f:
                     prompt = f.read()
                     short_caption = None
@@ -354,7 +354,7 @@ class CaptionProcessingDTOMixin:
                     if short_caption is not None:
                         short_caption = clean_caption(short_caption)
             else:
-                print_acc(f"DEBUG: No caption file found at {prompt_path}, using default caption")
+                # print_acc(f"DEBUG: No caption file found at {prompt_path}, using default caption")
                 prompt = ''
                 if self.dataset_config.default_caption is not None:
                     prompt = self.dataset_config.default_caption
