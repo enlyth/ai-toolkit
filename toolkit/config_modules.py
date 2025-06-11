@@ -906,7 +906,9 @@ class DatasetConfig:
         self.cache_clip_vision_to_disk: bool = kwargs.get(
             "cache_clip_vision_to_disk", False
         )
-
+        self.preserve_exact_resolutions: bool = kwargs.get(
+            "preserve_exact_resolutions", False
+        )
         self.standardize_images: bool = kwargs.get("standardize_images", False)
 
         # https://albumentations.ai/docs/api_reference/augmentations/transforms

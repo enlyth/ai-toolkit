@@ -2485,6 +2485,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         try:
                             with self.timer("get_batch"):
                                 batch = next(dataloader_iterator)
+                            prompts = batch.get_caption_list()
+                            print_acc(f"DEBUG: Raw prompts from batch: {prompts}")
                         except StopIteration:
                             with self.timer("reset_batch"):
                                 # hit the end of an epoch, reset
@@ -2499,6 +2501,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                     self.grad_accumulation_step = 0
                             with self.timer("get_batch"):
                                 batch = next(dataloader_iterator)
+                                prompts = batch.get_caption_list()
+                                print_acc(f"DEBUG: Raw prompts from batch: {prompts}")
                             if self.progress_bar is not None:
                                 self.progress_bar.unpause()
                     else:
