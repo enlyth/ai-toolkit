@@ -53,11 +53,13 @@ export interface NetworkConfig {
   type: string;
   linear: number;
   linear_alpha: number;
+  conv: number;
+  conv_alpha: number;
   lokr_full_rank: boolean;
   lokr_factor: number;
   network_kwargs: {
     ignore_if_contains: string[];
-  }
+  };
 }
 
 export interface SaveConfig {
@@ -81,6 +83,7 @@ export interface DatasetConfig {
   cache_latents_to_disk?: boolean;
   resolution: number[];
   controls: string[];
+  control_path: string | null;
 }
 
 export interface EMAConfig {
@@ -123,7 +126,7 @@ export interface ModelConfig {
   quantize_kwargs?: QuantizeKwargsConfig;
   arch: string;
   low_vram: boolean;
-  model_kwargs: {[key: string]: any};
+  model_kwargs: { [key: string]: any };
 }
 
 export interface SampleConfig {
@@ -170,4 +173,9 @@ export interface JobConfig {
   job: string;
   config: ConfigObject;
   meta: MetaConfig;
+}
+
+export interface ConfigDoc {
+  title: string;
+  description: React.ReactNode;
 }

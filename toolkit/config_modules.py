@@ -1,6 +1,6 @@
 import os
 import time
-from typing import List, Optional, Literal, Union, TYPE_CHECKING, Dict
+from typing import List, Optional, Literal, Tuple, Union, TYPE_CHECKING, Dict
 import random
 import torch
 
@@ -484,7 +484,7 @@ class TrainConfig:
             "correct_pred_norm_multiplier", 1.0
         )
 
-        self.loss_type = kwargs.get("loss_type", "mse")  # mse, mae, wavelet, pixelspace
+        self.loss_type = kwargs.get('loss_type', 'mse') # mse, mae, wavelet, pixelspace, mean_flow
 
         # scale the prediction by this. Increase for more detail, decrease for less
         self.pred_scaler = kwargs.get("pred_scaler", 1.0)
@@ -506,23 +506,13 @@ class TrainConfig:
         self.ema_config: EMAConfig = EMAConfig(**ema_config)
 
         # adds an additional loss to the network to encourage it output a normalized standard deviation
-        self.target_norm_std = kwargs.get("target_norm_std", None)
-        self.target_norm_std_value = kwargs.get("target_norm_std_value", 1.0)
-        self.timestep_type = kwargs.get(
-            "timestep_type", "sigmoid"
-        )  # sigmoid, linear, lognorm_blend
-        self.linear_timesteps = kwargs.get("linear_timesteps", False)
-        self.linear_timesteps2 = kwargs.get("linear_timesteps2", False)
-        self.disable_sampling = kwargs.get("disable_sampling", False)
-        self.target_norm_std = kwargs.get("target_norm_std", None)
-        self.target_norm_std_value = kwargs.get("target_norm_std_value", 1.0)
-        self.timestep_type = kwargs.get(
-            "timestep_type", "sigmoid"
-        )  # sigmoid, linear, lognorm_blend, next_sample
-        self.next_sample_timesteps = kwargs.get("next_sample_timesteps", 8)
-        self.linear_timesteps = kwargs.get("linear_timesteps", False)
-        self.linear_timesteps2 = kwargs.get("linear_timesteps2", False)
-        self.disable_sampling = kwargs.get("disable_sampling", False)
+        self.target_norm_std = kwargs.get('target_norm_std', None)
+        self.target_norm_std_value = kwargs.get('target_norm_std_value', 1.0)
+        self.timestep_type = kwargs.get('timestep_type', 'sigmoid')  # sigmoid, linear, lognorm_blend, next_sample, weighted, one_step
+        self.next_sample_timesteps = kwargs.get('next_sample_timesteps', 8)
+        self.linear_timesteps = kwargs.get('linear_timesteps', False)
+        self.linear_timesteps2 = kwargs.get('linear_timesteps2', False)
+        self.disable_sampling = kwargs.get('disable_sampling', False)
 
         # will cache a blank prompt or the trigger word, and unload the text encoder to cpu
         # will make training faster and use less vram
@@ -535,21 +525,28 @@ class TrainConfig:
         self.bypass_guidance_embedding = kwargs.get("bypass_guidance_embedding", False)
 
         # diffusion feature extractor
-        self.diffusion_feature_extractor_path = kwargs.get(
-            "diffusion_feature_extractor_path", None
-        )
-        self.diffusion_feature_extractor_weight = kwargs.get(
-            "diffusion_feature_extractor_weight", 1.0
-        )
-
+        self.latent_feature_extractor_path = kwargs.get('latent_feature_extractor_path', None)
+        self.latent_feature_loss_weight = kwargs.get('latent_feature_loss_weight', 1.0)
+        
+        # we use this in the code, but it really needs to be called latent_feature_extractor as that makes more sense with new architecture
+        self.diffusion_feature_extractor_path = kwargs.get('diffusion_feature_extractor_path', self.latent_feature_extractor_path)
+        self.diffusion_feature_extractor_weight = kwargs.get('diffusion_feature_extractor_weight', self.latent_feature_loss_weight)
+        
         # optimal noise pairing
         self.optimal_noise_pairing_samples = kwargs.get(
             "optimal_noise_pairing_samples", 1
         )
 
         # forces same noise for the same image at a given size.
-        self.force_consistent_noise = kwargs.get("force_consistent_noise", False)
-        self.blended_blur_noise = kwargs.get("blended_blur_noise", False)
+        self.force_consistent_noise = kwargs.get('force_consistent_noise', False)
+        self.blended_blur_noise = kwargs.get('blended_blur_noise', False)
+        
+        # contrastive loss
+        self.do_guidance_loss = kwargs.get('do_guidance_loss', False)
+        self.guidance_loss_target: Union[int, List[int, int]] = kwargs.get('guidance_loss_target', 3.0)
+        self.unconditional_prompt: str = kwargs.get('unconditional_prompt', '')
+        if isinstance(self.guidance_loss_target, tuple):
+            self.guidance_loss_target = list(self.guidance_loss_target)
 
 
 ModelArch = Literal[
@@ -846,30 +843,26 @@ class DatasetConfig:
         self.random_triggers_max: int = kwargs.get("random_triggers_max", 1)
         self.caption_ext: str = kwargs.get("caption_ext", ".txt")
         # if caption_ext doesnt start with a dot, add it
-        if self.caption_ext and not self.caption_ext.startswith("."):
-            self.caption_ext = "." + self.caption_ext
-        self.random_scale: bool = kwargs.get("random_scale", False)
-        self.random_crop: bool = kwargs.get("random_crop", False)
-        self.resolution: int = kwargs.get("resolution", 512)
-        self.scale: float = kwargs.get("scale", 1.0)
-        self.buckets: bool = kwargs.get("buckets", True)
-        self.bucket_tolerance: int = kwargs.get("bucket_tolerance", 64)
-        self.is_reg: bool = kwargs.get("is_reg", False)
-        self.network_weight: float = float(kwargs.get("network_weight", 1.0))
-        self.token_dropout_rate: float = float(kwargs.get("token_dropout_rate", 0.0))
-        self.shuffle_tokens: bool = kwargs.get("shuffle_tokens", False)
-        self.caption_dropout_rate: float = float(
-            kwargs.get("caption_dropout_rate", 0.0)
-        )
-        self.keep_tokens: int = kwargs.get(
-            "keep_tokens", 0
-        )  # #of first tokens to always keep unless caption dropped
-        self.flip_x: bool = kwargs.get("flip_x", False)
-        self.flip_y: bool = kwargs.get("flip_y", False)
-        self.augments: List[str] = kwargs.get("augments", [])
-        self.control_path: Union[str, List[str]] = kwargs.get(
-            "control_path", None
-        )  # depth maps, etc
+        if self.caption_ext and not self.caption_ext.startswith('.'):
+            self.caption_ext = '.' + self.caption_ext
+        self.random_scale: bool = kwargs.get('random_scale', False)
+        self.random_crop: bool = kwargs.get('random_crop', False)
+        self.resolution: int = kwargs.get('resolution', 512)
+        self.scale: float = kwargs.get('scale', 1.0)
+        self.buckets: bool = kwargs.get('buckets', True)
+        self.bucket_tolerance: int = kwargs.get('bucket_tolerance', 64)
+        self.is_reg: bool = kwargs.get('is_reg', False)
+        self.network_weight: float = float(kwargs.get('network_weight', 1.0))
+        self.token_dropout_rate: float = float(kwargs.get('token_dropout_rate', 0.0))
+        self.shuffle_tokens: bool = kwargs.get('shuffle_tokens', False)
+        self.caption_dropout_rate: float = float(kwargs.get('caption_dropout_rate', 0.0))
+        self.keep_tokens: int = kwargs.get('keep_tokens', 0)  # #of first tokens to always keep unless caption dropped
+        self.flip_x: bool = kwargs.get('flip_x', False)
+        self.flip_y: bool = kwargs.get('flip_y', False)
+        self.augments: List[str] = kwargs.get('augments', [])
+        self.control_path: Union[str,List[str]] = kwargs.get('control_path', None)  # depth maps, etc
+        if self.control_path == '':
+            self.control_path = None
         # inpaint images should be webp/png images with alpha channel. The alpha 0 (invisible) section will
         # be the part conditioned to be inpainted. The alpha 1 (visible) section will be the part that is ignored
         self.inpaint_path: Union[str, List[str]] = kwargs.get("inpaint_path", None)
@@ -981,7 +974,10 @@ class DatasetConfig:
         if isinstance(self.controls, str):
             self.controls = [self.controls]
         # remove empty strings
-        self.controls = [control for control in self.controls if control.strip() != ""]
+        self.controls = [control for control in self.controls if control.strip() != '']
+        
+        # if true, will use a fask method to get image sizes. This can result in errors. Do not use unless you know what you are doing
+        self.fast_image_size: bool = kwargs.get('fast_image_size', False)
 
 
 def preprocess_dataset_raw_config(raw_config: List[dict]) -> List[dict]:
@@ -1301,3 +1297,6 @@ def validate_configs(
         if model_config.use_flux_cfg:
             # bypass the embedding
             train_config.bypass_guidance_embedding = True
+    if train_config.bypass_guidance_embedding and train_config.do_guidance_loss:
+        raise ValueError("Cannot bypass guidance embedding and do guidance loss at the same time. "
+                         "Please set bypass_guidance_embedding to False or do_guidance_loss to False.")

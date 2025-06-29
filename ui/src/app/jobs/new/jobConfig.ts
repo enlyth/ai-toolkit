@@ -2,6 +2,7 @@ import { JobConfig, DatasetConfig } from '@/types';
 
 export const defaultDatasetConfig: DatasetConfig = {
   folder_path: '/path/to/images/folder',
+  control_path: null,
   mask_path: null,
   mask_min_value: 0.1,
   default_caption: '',
@@ -30,6 +31,8 @@ export const defaultJobConfig: JobConfig = {
           type: 'lora',
           linear: 32,
           linear_alpha: 32,
+          conv: 16,
+          conv_alpha: 16,
           lokr_full_rank: true,
           lokr_factor: -1,
           network_kwargs: {
