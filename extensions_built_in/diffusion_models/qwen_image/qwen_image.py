@@ -10,10 +10,9 @@ from toolkit.models.base_model import BaseModel
 from toolkit.basic import flush
 from toolkit.prompt_utils import PromptEmbeds
 from toolkit.samplers.custom_flowmatch_sampler import CustomFlowMatchEulerDiscreteScheduler
-from toolkit.dequantize import patch_dequantization_on_save
 from toolkit.accelerator import get_accelerator, unwrap_model
 from optimum.quanto import freeze, QTensor
-from toolkit.util.quantize import quantize, get_qtype
+from toolkit.util.quantize import quantize, get_qtype, quantize_model
 import torch.nn.functional as F
 
 from diffusers import QwenImagePipeline, QwenImageTransformer2DModel, AutoencoderKLQwenImage
@@ -99,23 +98,9 @@ class QwenImageModel(BaseModel):
         )
 
         if self.model_config.quantize:
-            # patch the state dict method
-            patch_dequantization_on_save(transformer)
-            # move and quantize only certain pieces at a time.
-            quantization_type = get_qtype(self.model_config.qtype)
-            all_blocks = list(transformer.transformer_blocks)
-            self.print_and_status_update(" - quantizing transformer blocks")
-            for block in tqdm(all_blocks):
-                block.to(self.device_torch, dtype=dtype)
-                quantize(block, weights=quantization_type)
-                freeze(block)
-                block.to('cpu')
-                # flush()
-            
-            self.print_and_status_update(" - quantizing extras")
-            transformer.to(self.device_torch, dtype=dtype)
-            quantize(transformer, weights=quantization_type)
-            freeze(transformer)
+            self.print_and_status_update("Quantizing Transformer")
+            quantize_model(self, transformer)
+            flush()
         
         if self.model_config.low_vram:
             self.print_and_status_update("Moving transformer to CPU")
@@ -225,6 +210,17 @@ class QwenImageModel(BaseModel):
                 control_img = control_img.resize(
                     (gen_config.width, gen_config.height), Image.BILINEAR
                 )
+        
+        # flush for low vram if we are doing that
+        flush_between_steps = self.model_config.low_vram
+            # Fix a bug in diffusers/torch
+        def callback_on_step_end(pipe, i, t, callback_kwargs):
+            if flush_between_steps:
+                flush()
+            latents = callback_kwargs["latents"]
+            
+            return {"latents": latents}
+        
         sc = self.get_bucket_divisibility()
         gen_config.width = int(gen_config.width  // sc * sc)
         gen_config.height = int(gen_config.height // sc * sc)
@@ -239,6 +235,7 @@ class QwenImageModel(BaseModel):
             true_cfg_scale=gen_config.guidance_scale,
             latents=gen_config.latents,
             generator=generator,
+            callback_on_step_end=callback_on_step_end,
             **extra
         ).images[0]
         return img
@@ -251,34 +248,44 @@ class QwenImageModel(BaseModel):
         **kwargs
     ):
         batch_size, num_channels_latents, height, width = latent_model_input.shape
-        
+
+        # pack image tokens
         latent_model_input = latent_model_input.view(batch_size, num_channels_latents, height // 2, 2, width // 2, 2)
         latent_model_input = latent_model_input.permute(0, 2, 4, 1, 3, 5)
         latent_model_input = latent_model_input.reshape(batch_size, (height // 2) * (width // 2), num_channels_latents * 4)
-        
-        # make txt_seq_lens match the actual encoder_hidden_states length, and clamp the mask ---
-        seq_len = text_embeddings.text_embeds.shape[1]
-        prompt_embeds_mask = text_embeddings.attention_mask.to(self.device_torch, dtype=torch.int64)[:, :seq_len]
-        txt_seq_lens = [seq_len] * batch_size
 
-        img_shapes = [(1, height // 2, width  // 2)] * batch_size
+        # clamp text length to RoPE capacity for this image size
+        # img_shapes passed to the model
+        img_h2, img_w2 = height // 2, width // 2
+        img_shapes = [(1, img_h2, img_w2)] * batch_size
+
+        # QwenEmbedRope logic:
+        max_vid_index = max(img_h2 // 2, img_w2 // 2)
+
+        rope_cap = 1024 - max_vid_index  # available text positions in RoPE cache
+        seq_len_actual = text_embeddings.text_embeds.shape[1]
+        use_len = min(seq_len_actual, rope_cap)
+
+        enc_hs = text_embeddings.text_embeds[:, :use_len].to(self.device_torch, self.torch_dtype)
+        prompt_embeds_mask = text_embeddings.attention_mask.to(self.device_torch, dtype=torch.int64)[:, :use_len]
+        txt_seq_lens = [use_len] * batch_size
 
         noise_pred = self.transformer(
             hidden_states=latent_model_input.to(self.device_torch, self.torch_dtype),
             timestep=timestep / 1000,
             guidance=None,
-            encoder_hidden_states=text_embeddings.text_embeds.to(self.device_torch, self.torch_dtype),
+            encoder_hidden_states=enc_hs,
             encoder_hidden_states_mask=prompt_embeds_mask,
             img_shapes=img_shapes,
             txt_seq_lens=txt_seq_lens,
             return_dict=False,
             **kwargs,
         )[0]
-        
+
+        # unpack
         noise_pred = noise_pred.view(batch_size, height // 2, width // 2, num_channels_latents, 2, 2)
         noise_pred = noise_pred.permute(0, 3, 1, 4, 2, 5)
         noise_pred = noise_pred.reshape(batch_size, num_channels_latents, height, width)
-        
         return noise_pred
     
     def get_prompt_embeds(self, prompt: str) -> PromptEmbeds:

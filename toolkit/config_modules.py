@@ -462,7 +462,7 @@ class TrainConfig:
 
         ema_config: Union[Dict, None] = kwargs.get('ema_config', None)
         # if it is set explicitly to false, leave it false. 
-        if ema_config is not None and ema_config.get('use_ema', None) is not None:
+        if ema_config is not None and ema_config.get('use_ema', False):
             ema_config['use_ema'] = True
             print(f"Using EMA")
         else:
@@ -600,6 +600,16 @@ class ModelConfig:
         # only setup for some models but will prevent having to download the te for
         # 20 different model variants
         self.extras_name_or_path = kwargs.get("extras_name_or_path", self.name_or_path)
+        
+        # path to an accuracy recovery adapter, either local or remote
+        self.accuracy_recovery_adapter = kwargs.get("accuracy_recovery_adapter", None)
+        
+        # parse ARA from qtype
+        if self.qtype is not None and "|" in self.qtype:
+            self.qtype, self.accuracy_recovery_adapter = self.qtype.split('|')
+
+        # compile the model with torch compile
+        self.compile = kwargs.get("compile", False)
         
         # kwargs to pass to the model
         self.model_kwargs = kwargs.get("model_kwargs", {})

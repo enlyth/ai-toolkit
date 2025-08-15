@@ -372,11 +372,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
         })
         o_dict['ss_base_model_version'] = self.sd.get_base_model_version()
 
-        o_dict = add_base_model_info_to_meta(
-            o_dict,
-            is_v2=self.model_config.is_v2,
-            is_xl=self.model_config.is_xl,
-        )
+        # o_dict = add_base_model_info_to_meta(
+        #     o_dict,
+        #     is_v2=self.model_config.is_v2,
+        #     is_xl=self.model_config.is_xl,
+        # )
         o_dict['ss_output_name'] = self.job.name
 
         if self.trigger_word is not None:
@@ -1533,6 +1533,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # run base sd process run
         self.sd.load_model()
         
+        # compile the model if needed
+        if self.model_config.compile:
+            try:
+                torch.compile(self.sd.unet, dynamic=True, fullgraph=True, mode='max-autotune')
+            except Exception as e:
+                print_acc(f"Failed to compile model: {e}")
+                print_acc("Continuing without compilation")
+
         self.sd.add_after_sample_image_hook(self.sample_step_hook)
 
         dtype = get_torch_dtype(self.train_config.dtype)
