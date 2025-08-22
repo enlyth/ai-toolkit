@@ -123,7 +123,6 @@ class CaptionMixin:
             img_path = img_path_or_tuple if isinstance(img_path_or_tuple, str) else img_path_or_tuple.path
             # see if prompt file exists
             path_no_ext = os.path.splitext(img_path)[0]
-            ext = self.dataset_config.caption_ext
             prompt_path = path_no_ext + ext
                 
         # allow folders to have a default prompt
