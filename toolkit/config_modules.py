@@ -995,10 +995,18 @@ def preprocess_dataset_raw_config(raw_config: List[dict]) -> List[dict]:
     new_config = []
     for dataset in raw_config:
         resolution = dataset.get('resolution', 512)
+        preserve_resolutions = dataset.get('preserve_resolutions', False)
+
         if isinstance(resolution, list):
             resolution_list = resolution
         else:
             resolution_list = [resolution]
+
+        # When preserve_resolutions is True, resolution selection doesn't matter
+        # since we use original image dimensions. Ensure at least one dataset is created.
+        if preserve_resolutions and len(resolution_list) == 0:
+            resolution_list = [512]  # dummy value, won't be used
+
         for res in resolution_list:
             dataset_copy = dataset.copy()
             dataset_copy['resolution'] = res

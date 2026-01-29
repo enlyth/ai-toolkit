@@ -239,14 +239,18 @@ class BucketsMixin:
                     file_item.crop_y = int(file_item.scale_to_height / 2 - resolution / 2)
             elif not did_process_poi:
                 if hasattr(self.dataset_config, 'preserve_resolutions') and self.dataset_config.preserve_resolutions:
-                    # Don't resize at all
+                    # Use original dimensions but round down to be divisible by bucket_tolerance
+                    # This is required for VAE compatibility
+                    crop_width = (width // bucket_tolerance) * bucket_tolerance
+                    crop_height = (height // bucket_tolerance) * bucket_tolerance
                     file_item.scale_to_width = width
                     file_item.scale_to_height = height
-                    file_item.crop_width = width
-                    file_item.crop_height = height
-                    file_item.crop_x = 0
-                    file_item.crop_y = 0
-                    
+                    file_item.crop_width = crop_width
+                    file_item.crop_height = crop_height
+                    # Center crop for the small difference from rounding
+                    file_item.crop_x = (width - crop_width) // 2
+                    file_item.crop_y = (height - crop_height) // 2
+
                 else:
                     bucket_resolution = get_bucket_for_image_size(
                         width, height,
