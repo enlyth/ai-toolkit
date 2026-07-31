@@ -565,28 +565,63 @@ class ImageProcessingDTOMixin:
             if hasattr(self.dataset_config, 'debug') and self.dataset_config.debug:
                 print_acc(f"  Frames to extract: {frames_to_extract}")
             
-            # Extract frames
+            # Extract frames -- decode sequentially in a single pass. A cap.set() seek per
+            # frame forces a keyframe seek + GOP re-decode for every extracted frame
+            # (~20x slower); frames_to_extract is always ascending, so seek once to the
+            # first frame then grab() through the gaps.
             frames = []
-            for frame_idx in frames_to_extract:
-                # Safety check - ensure frame_idx is within bounds (silently fix)
-                if frame_idx > max_frame_index:
-                    frame_idx = max_frame_index
-                
-                # Set frame position
-                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-                
+            unique_frame_idxs = sorted(set(frames_to_extract))
+            processed_frames = {}  # frame_idx -> processed frame (duplicates reuse it)
+
+            def process_frame(rgb_frame):
+                # Convert to PIL Image
+                img = Image.fromarray(rgb_frame)
+
+                # Apply the same processing as for single images
+                img = img.convert('RGB')
+
+                if self.flip_x:
+                    img = img.transpose(Image.FLIP_LEFT_RIGHT)
+                if self.flip_y:
+                    img = img.transpose(Image.FLIP_TOP_BOTTOM)
+
+                # Apply bucketing
+                img = img.resize((self.scale_to_width, self.scale_to_height), Image.BICUBIC)
+                img = img.crop((
+                    self.crop_x,
+                    self.crop_y,
+                    self.crop_x + self.crop_width,
+                    self.crop_y + self.crop_height
+                ))
+
+                # Apply transform if provided
+                if transform:
+                    img = transform(img)
+
+                return img
+
+            decode_with_pyav = False
+
+            # Set frame position
+            pos = unique_frame_idxs[0]
+            if pos > 0:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
+
                 # Silently verify position was set correctly (no warnings unless debug mode)
                 if hasattr(self.dataset_config, 'debug') and self.dataset_config.debug:
                     actual_pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-                    if actual_pos != frame_idx:
-                        print_acc(f"Warning: Failed to set exact frame position. Requested: {frame_idx}, Actual: {actual_pos}")
-                
+                    if actual_pos != pos:
+                        print_acc(f"Warning: Failed to set exact frame position. Requested: {pos}, Actual: {actual_pos}")
+
+            for frame_idx in unique_frame_idxs:
+                # skip past frames between targets without decoding them to images
+                while pos < frame_idx and cap.grab():
+                    pos += 1
+
                 ret, frame = cap.read()
-                if not ret:
-                    # Try to provide more detailed error information
-                    actual_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-                    frame_pos_info = f"Requested frame: {frame_idx}, Actual frame position: {actual_frame}"
-                    
+                if ret:
+                    pos += 1
+                else:
                     # Try to read the next available frame as a fallback
                     fallback_success = False
                     for fallback_offset in [1, -1, 5, -5, 10, -10]:
@@ -599,41 +634,52 @@ class ImageProcessingDTOMixin:
                                 print_acc(f"Falling back to nearby frame {fallback_pos} instead of {frame_idx}")
                             frame = fallback_frame
                             fallback_success = True
+                            # resync sequential position after the fallback seek
+                            pos = fallback_pos + 1
                             break
                     else:
-                        # No fallback worked, raise a more detailed exception
-                        video_info = f"Video: {self.path}, Total frames: {total_frames}, FPS: {video_fps}"
-                        raise Exception(f"Failed to read frame {frame_idx} from video. {frame_pos_info}. {video_info}")
+                        # No fallback worked. cv2's bundled ffmpeg cannot decode some codecs
+                        # at all (e.g. AV1 has no software decoder there), so retry the
+                        # remaining frames with PyAV below.
+                        decode_with_pyav = True
+                        break
                 
                 # Convert BGR to RGB
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                
-                # Convert to PIL Image
-                img = Image.fromarray(frame)
-                
-                # Apply the same processing as for single images
-                img = img.convert('RGB')
-                
-                if self.flip_x:
-                    img = img.transpose(Image.FLIP_LEFT_RIGHT)
-                if self.flip_y:
-                    img = img.transpose(Image.FLIP_TOP_BOTTOM)
-                
-                # Apply bucketing
-                img = img.resize((self.scale_to_width, self.scale_to_height), Image.BICUBIC)
-                img = img.crop((
-                    self.crop_x,
-                    self.crop_y,
-                    self.crop_x + self.crop_width,
-                    self.crop_y + self.crop_height
-                ))
-                
-                # Apply transform if provided
-                if transform:
-                    img = transform(img)
-                
-                frames.append(img)
-            
+
+                processed_frames[frame_idx] = process_frame(frame)
+
+            if decode_with_pyav:
+                # cv2 could not decode this video (e.g. AV1: OpenCV's bundled ffmpeg has no
+                # software AV1 decoder). Decode the still-missing frames in one sequential
+                # PyAV pass; PyAV ships libdav1d so it handles codecs cv2 cannot.
+                import av
+
+                needed = {i for i in unique_frame_idxs if i not in processed_frames}
+                last_av_frame = None
+                with av.open(self.path) as container:
+                    decoded_idx = -1
+                    for av_frame in container.decode(video=0):
+                        decoded_idx += 1
+                        last_av_frame = av_frame
+                        if decoded_idx in needed:
+                            processed_frames[decoded_idx] = process_frame(av_frame.to_ndarray(format='rgb24'))
+                            needed.discard(decoded_idx)
+                            if not needed:
+                                break
+
+                if needed:
+                    if last_av_frame is None:
+                        video_info = f"Video: {self.path}, Total frames: {total_frames}, FPS: {video_fps}"
+                        raise Exception(f"Failed to read frames {sorted(needed)} from video with both cv2 and PyAV. {video_info}")
+                    # metadata frame count overshot the real stream; reuse the last decoded frame
+                    tail_frame = process_frame(last_av_frame.to_ndarray(format='rgb24'))
+                    for frame_idx in needed:
+                        processed_frames[frame_idx] = tail_frame
+
+            # assemble in extraction order; stretched clips repeat decoded frames
+            frames = [processed_frames[frame_idx] for frame_idx in frames_to_extract]
+
             # Release the video capture
             cap.release()
             
@@ -1622,6 +1668,16 @@ class ArgBreakMixin:
         pass
 
 
+def _latent_to_uint8(latent: torch.Tensor) -> torch.Tensor:
+    # pixel-space latents in [-1, 1] -> uint8 0..255 for compact caching
+    return ((latent.float().clamp(-1, 1) + 1.0) * 127.5).round().to(torch.uint8)
+
+
+def _latent_from_uint8(latent: torch.Tensor, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    # uint8 0..255 -> pixel-space latents in [-1, 1]
+    return (latent.to(torch.float32) / 127.5 - 1.0).to(dtype)
+
+
 class LatentCachingFileItemDTOMixin:
     def __init__(self, *args, **kwargs):
         # if we have super, call it
@@ -1722,8 +1778,13 @@ class LatentCachingFileItemDTOMixin:
                 device='cpu'
             )
             self._encoded_latent = state_dict['latent']
+            if self._encoded_latent.dtype == torch.uint8:
+                # pixel-space latents cached as uint8
+                self._encoded_latent = _latent_from_uint8(self._encoded_latent)
             if 'first_frame_latent' in state_dict:
                 self._cached_first_frame_latent = state_dict['first_frame_latent']
+                if self._cached_first_frame_latent.dtype == torch.uint8:
+                    self._cached_first_frame_latent = _latent_from_uint8(self._cached_first_frame_latent)
             if 'audio_latent' in state_dict:
                 self._cached_audio_latent = state_dict['audio_latent']
             if 'num_frames' in state_dict:
@@ -1765,9 +1826,16 @@ class LatentCachingMixin:
                     if to_memory:
                         # load it into memory
                         state_dict = load_file(latent_path, device='cpu')
-                        file_item._encoded_latent = state_dict['latent'].to('cpu', dtype=self.sd.torch_dtype)
+                        cached_latent = state_dict['latent']
+                        if cached_latent.dtype == torch.uint8:
+                            # pixel-space latents cached as uint8
+                            cached_latent = _latent_from_uint8(cached_latent)
+                        file_item._encoded_latent = cached_latent.to('cpu', dtype=self.sd.torch_dtype)
                         if 'first_frame_latent' in state_dict:
-                            file_item._cached_first_frame_latent = state_dict['first_frame_latent'].to('cpu', dtype=self.sd.torch_dtype)
+                            cached_first_frame = state_dict['first_frame_latent']
+                            if cached_first_frame.dtype == torch.uint8:
+                                cached_first_frame = _latent_from_uint8(cached_first_frame)
+                            file_item._cached_first_frame_latent = cached_first_frame.to('cpu', dtype=self.sd.torch_dtype)
                         if 'audio_latent' in state_dict:
                             file_item._cached_audio_latent = state_dict['audio_latent'].to('cpu', dtype=self.sd.torch_dtype)
                 else:
@@ -1781,11 +1849,15 @@ class LatentCachingMixin:
                     audio_latent = None
                     frames = None
                     # add batch dimension
+                    cache_uint8 = getattr(self.sd, 'cache_latents_as_uint8', False)
                     try:
                         imgs = file_item.tensor.unsqueeze(0).to(device, dtype=dtype)
                         latent = self.sd.encode_images(imgs).squeeze(0)
                         if to_disk:
-                            state_dict['latent'] = latent.clone().detach().cpu()
+                            if cache_uint8:
+                                state_dict['latent'] = _latent_to_uint8(latent).cpu()
+                            else:
+                                state_dict['latent'] = latent.clone().detach().cpu()
                     except Exception as e:
                         print_acc(f"Error processing image: {file_item.path}")
                         print_acc(f"Error: {str(e)}")
@@ -1802,7 +1874,10 @@ class LatentCachingMixin:
                             raise ValueError(f"Unknown frame shape {frames.shape}")
                         first_frame_latent = self.sd.encode_images(first_frames).squeeze(0)
                         if to_disk:
-                            state_dict['first_frame_latent'] = first_frame_latent.clone().detach().cpu()
+                            if cache_uint8:
+                                state_dict['first_frame_latent'] = _latent_to_uint8(first_frame_latent).cpu()
+                            else:
+                                state_dict['first_frame_latent'] = first_frame_latent.clone().detach().cpu()
                     
                     # audio (video+audio models only — audio-only models already encoded above via encode_images)
                     if not self.is_audio_model and file_item.audio_data is not None:
@@ -1868,6 +1943,13 @@ class TextEmbeddingFileItemDTOMixin:
         # if we have a control image, cache the path
         if self.encode_control_in_text_embeddings and self.control_path is not None:
             item["control_path"] = self.control_path
+        # first-frame vision conditioning changes the embedding content -> new cache key
+        elif (
+            getattr(self, "encode_first_frame_in_text_embeddings", False)
+            and self.dataset_config.do_i2v
+            and (self.dataset_config.auto_frame_count or self.dataset_config.num_frames > 1)
+        ):
+            item["first_frame_in_te"] = True
         return item
 
     def get_text_embedding_path(self: 'FileItemDTO', recalculate=False):
@@ -1953,6 +2035,27 @@ class TextEmbeddingCachingMixin:
                         else:
                             ctrl_img = ctrl_img_list
                         prompt_embeds: PromptEmbeds = self.sd.encode_prompt(file_item.caption, control_images=ctrl_img)
+                    elif (
+                        getattr(self.sd, 'encode_first_frame_in_text_embeddings', False)
+                        and self.dataset_config.do_i2v
+                        and (self.dataset_config.auto_frame_count or self.dataset_config.num_frames > 1)
+                    ):
+                        # video item: encode the clip's FIRST FRAME into the text embeddings
+                        # as a vision reference, matching sampling (where the ctrl image goes
+                        # into the embeds and is held as the clean first frames)
+                        file_item.load_and_process_image(self.transform, only_load_latents=True)
+                        frames = file_item.tensor  # (T, C, H, W) or (C, H, W), in [-1, 1]
+                        first = frames[0] if frames.dim() == 4 else frames
+                        ctrl_img = (
+                            ((first + 1.0) / 2.0)
+                            .clamp(0, 1)
+                            .unsqueeze(0)
+                            .to(self.sd.device_torch, dtype=self.sd.torch_dtype)
+                        )
+                        if self.sd.has_multiple_control_images:
+                            ctrl_img = [ctrl_img]
+                        prompt_embeds: PromptEmbeds = self.sd.encode_prompt(file_item.caption, control_images=ctrl_img)
+                        file_item.tensor = None
                     else:
                         prompt_embeds: PromptEmbeds = self.sd.encode_prompt(file_item.caption)
                     # save it
