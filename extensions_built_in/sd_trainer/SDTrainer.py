@@ -17,6 +17,11 @@ from toolkit.config_modules import GenerateImageConfig
 from toolkit.data_loader import get_dataloader_datasets
 from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO, FileItemDTO
 from toolkit.guidance import get_targeted_guidance_loss, get_guidance_loss, GuidanceType
+from toolkit.guidance_loss import (
+    GuidanceLossSchedule,
+    disable_trainable_network,
+    guidance_loss_weights,
+)
 from toolkit.image_utils import show_tensors, show_latents
 from toolkit.ip_adapter import IPAdapter
 from toolkit.custom_adapter import CustomAdapter
@@ -108,6 +113,84 @@ class SDTrainer(BaseSDTrainProcess):
             self._guidance_loss_target_batch = float(self.train_config.guidance_loss_target[0])
         else:
             raise ValueError(f"Unknown guidance loss target type {type(self.train_config.guidance_loss_target)}")
+
+        audio_guidance_target = self.train_config.audio_guidance_loss_target
+        if audio_guidance_target is None:
+            audio_guidance_target = self.train_config.guidance_loss_target
+        self._audio_guidance_loss_target_batch: float = 0.0
+        if isinstance(audio_guidance_target, (int, float)):
+            self._audio_guidance_loss_target_batch = float(audio_guidance_target)
+        elif isinstance(audio_guidance_target, list):
+            self._audio_guidance_loss_target_batch = float(audio_guidance_target[0])
+        else:
+            raise ValueError(
+                f"Unknown audio guidance loss target type {type(audio_guidance_target)}"
+            )
+
+        self._calibrated_guidance_schedule = None
+        if self.train_config.guidance_loss_schedule == 'calibrated':
+            if not self.train_config.guidance_loss_schedule_path:
+                raise ValueError(
+                    "guidance_loss_schedule_path is required when "
+                    "guidance_loss_schedule is 'calibrated'"
+                )
+            self._calibrated_guidance_schedule = GuidanceLossSchedule(
+                self.train_config.guidance_loss_schedule_path,
+                curve=self.train_config.guidance_loss_schedule_curve,
+            )
+            print_acc(
+                "Loaded calibrated guidance schedule from "
+                f"{self._calibrated_guidance_schedule.path}"
+            )
+
+    def _get_guidance_loss_scales(
+        self,
+        target,
+        timesteps: torch.Tensor,
+        batch: DataLoaderBatchDTO,
+        stream: str,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        batch_size = timesteps.reshape(-1).shape[0]
+        target_tensor = torch.as_tensor(target, device=device, dtype=dtype).reshape(-1)
+        if target_tensor.numel() == 1:
+            target_tensor = target_tensor.expand(batch_size)
+        elif target_tensor.numel() != batch_size:
+            raise ValueError(
+                f"{stream} guidance target has {target_tensor.numel()} values for "
+                f"a batch of {batch_size}"
+            )
+
+        schedule = self.train_config.guidance_loss_schedule
+        if schedule == 'constant':
+            return target_tensor
+
+        if schedule == 'sigma':
+            if stream == 'audio':
+                sigma = getattr(batch, 'audio_sigma', None)
+                if sigma is None:
+                    sigma = timesteps / 1000.0
+            else:
+                sigma = timesteps / 1000.0
+            sigma = sigma.to(device=device, dtype=dtype).reshape(-1)
+            return 1.0 + (target_tensor - 1.0) * sigma
+
+        if schedule == 'calibrated':
+            if hasattr(self.sd, 'get_guidance_loss_schedule_coordinate'):
+                sigma = self.sd.get_guidance_loss_schedule_coordinate(
+                    timesteps, batch=batch, stream=stream
+                )
+            else:
+                sigma = timesteps.float().reshape(-1) / 1000.0
+            sigma = sigma.to(device=device, dtype=dtype).reshape(-1)
+            return self._calibrated_guidance_schedule.scales(
+                sigma=sigma,
+                stream=stream,
+                fallback=target_tensor,
+            )
+
+        raise ValueError(f"Unknown guidance loss schedule: {schedule}")
 
 
     def before_model_load(self):
@@ -251,14 +334,19 @@ class SDTrainer(BaseSDTrainProcess):
         
         # cache unconditional embeds (blank prompt)
         with torch.no_grad():
-            kwargs = {}
-            if self.sd.encode_control_in_text_embeddings:
-                # just do a blank image for unconditionals
-                control_image = torch.zeros((1, 3, 224, 224), device=self.sd.device_torch, dtype=self.sd.torch_dtype)
-                if self.sd.has_multiple_control_images:
-                    control_image = [control_image]
-                
-                kwargs['control_images'] = control_image
+            if hasattr(self.sd, 'get_unconditional_prompt_kwargs'):
+                kwargs = self.sd.get_unconditional_prompt_kwargs()
+            else:
+                kwargs = {}
+                if self.sd.encode_control_in_text_embeddings:
+                    control_image = torch.zeros(
+                        (1, 3, 224, 224),
+                        device=self.sd.device_torch,
+                        dtype=self.sd.torch_dtype,
+                    )
+                    if self.sd.has_multiple_control_images:
+                        control_image = [control_image]
+                    kwargs['control_images'] = control_image
             self.unconditional_embeds = self.sd.encode_prompt(
                 [self.train_config.unconditional_prompt],
                 long_prompts=self.do_long_prompts,
@@ -316,13 +404,19 @@ class SDTrainer(BaseSDTrainProcess):
                     raise ValueError("Cannot unload text encoder if training text encoder")
                 # cache embeddings
                 self.sd.text_encoder_to(self.device_torch)
-                encode_kwargs = {}
-                if self.sd.encode_control_in_text_embeddings:
-                    # just do a blank image for unconditionals
-                    control_image = torch.zeros((1, 3, 224, 224), device=self.sd.device_torch, dtype=self.sd.torch_dtype)
-                    if self.sd.has_multiple_control_images:
-                        control_image = [control_image]
-                    encode_kwargs['control_images'] = control_image
+                if hasattr(self.sd, 'get_unconditional_prompt_kwargs'):
+                    encode_kwargs = self.sd.get_unconditional_prompt_kwargs()
+                else:
+                    encode_kwargs = {}
+                    if self.sd.encode_control_in_text_embeddings:
+                        control_image = torch.zeros(
+                            (1, 3, 224, 224),
+                            device=self.sd.device_torch,
+                            dtype=self.sd.torch_dtype,
+                        )
+                        if self.sd.has_multiple_control_images:
+                            control_image = [control_image]
+                        encode_kwargs['control_images'] = control_image
                 self.cached_blank_embeds = self.sd.encode_prompt("", **encode_kwargs)
                 if self.trigger_word is not None:
                     self.cached_trigger_embeds = self.sd.encode_prompt(self.trigger_word, **encode_kwargs)
@@ -500,6 +594,8 @@ class SDTrainer(BaseSDTrainProcess):
         loss_target = self.train_config.loss_target
         is_reg = any(batch.get_is_reg_list())
         additional_loss = 0.0
+        guidance_loss_multiplier = None
+        audio_guidance_loss_multiplier = None
 
         prior_mask_multiplier = None
         target_mask_multiplier = None
@@ -696,92 +792,87 @@ class SDTrainer(BaseSDTrainProcess):
         
         if self.train_config.do_guidance_loss:
             with torch.no_grad():
-                # we make cached blank prompt embeds that match the batch size
+                # Match cfg_recovery against the frozen base null branch. If the
+                # LoRA remains active here it can reduce loss by moving the anchor
+                # instead of learning the intended conditional delta.
                 unconditional_embeds = concat_prompt_embeds(
                     [self.unconditional_embeds] * noisy_latents.shape[0],
                 )
-                # joint audio models route this pass's audio pred to its own
-                # slot so it cannot stomp the primary pred on the batch
                 batch.audio_pred_slot = 'audio_pred_uncond'
-                unconditional_target = self.predict_noise(
-                    noisy_latents=noisy_latents,
-                    timesteps=timesteps,
-                    conditional_embeds=unconditional_embeds,
-                    unconditional_embeds=None,
-                    batch=batch,
-                )
-                batch.audio_pred_slot = None
-                is_video = len(target.shape) == 5
-                
+                try:
+                    with disable_trainable_network(self.network):
+                        unconditional_target = self.predict_noise(
+                            noisy_latents=noisy_latents,
+                            timesteps=timesteps,
+                            conditional_embeds=unconditional_embeds,
+                            unconditional_embeds=None,
+                            batch=batch,
+                        )
+                finally:
+                    batch.audio_pred_slot = None
+
+                batch_size = target.shape[0]
+                target_dims = [1] * (target.dim() - 1)
+
                 if self.train_config.do_guidance_loss_cfg_zero:
-                    # zero cfg
                     # ref https://github.com/WeichenFan/CFG-Zero-star/blob/cdac25559e3f16cb95f0016c04c709ea1ab9452b/wan_pipeline.py#L557
-                    batch_size = target.shape[0]
                     positive_flat = target.view(batch_size, -1)
                     negative_flat = unconditional_target.view(batch_size, -1)
-                    # Calculate dot production
                     dot_product = torch.sum(positive_flat * negative_flat, dim=1, keepdim=True)
-                    # Squared norm of uncondition
                     squared_norm = torch.sum(negative_flat ** 2, dim=1, keepdim=True) + 1e-8
-                    # st_star = v_cond^T * v_uncond / ||v_uncond||^2
-                    st_star = dot_product / squared_norm
-
-                    alpha = st_star
-                    
-                    alpha = alpha.view(batch_size, 1, 1, 1) if not is_video else alpha.view(batch_size, 1, 1, 1, 1)
+                    alpha = (dot_product / squared_norm).view(-1, *target_dims)
                 else:
                     alpha = 1.0
 
-                guidance_scale = self._guidance_loss_target_batch
-                if isinstance(guidance_scale, list):
-                    guidance_scale = torch.tensor(guidance_scale).to(target.device, dtype=target.dtype)
-                    guidance_scale = guidance_scale.view(-1, 1, 1, 1) if not is_video else guidance_scale.view(-1, 1, 1, 1, 1)
-
-                if self.train_config.guidance_loss_schedule == 'sigma':
-                    # the (target - uncond) sample direction carries s * fresh_noise
-                    # that nothing can predict at low sigma, so decay the
-                    # extrapolation toward a plain flow target as sigma falls
-                    sigma = (timesteps.to(target.device) / 1000.0).to(target.dtype)
-                    sigma = sigma.view(-1, 1, 1, 1) if not is_video else sigma.view(-1, 1, 1, 1, 1)
-                    guidance_scale = 1.0 + (guidance_scale - 1.0) * sigma
+                video_scales = self._get_guidance_loss_scales(
+                    target=self._guidance_loss_target_batch,
+                    timesteps=timesteps,
+                    batch=batch,
+                    stream='video',
+                    device=target.device,
+                    dtype=target.dtype,
+                )
+                guidance_loss_multiplier = guidance_loss_weights(
+                    video_scales, self.train_config.guidance_loss_weighting
+                )
+                guidance_scale = video_scales.view(-1, *target_dims)
 
                 unconditional_target = unconditional_target * alpha
-                target = unconditional_target + guidance_scale * (target - unconditional_target)
+                target = unconditional_target + guidance_scale * (
+                    target - unconditional_target
+                )
 
-                # joint audio models (ltx2, minimax_h3, flux3) carry their audio
-                # target/pred on the batch. Extrapolate the audio target the
-                # same way so the audio stream trains contrastively as well.
+                # Joint audio models carry their target/pred on the batch. Audio
+                # gets its own endpoint or calibrated schedule column.
                 audio_uncond = getattr(batch, 'audio_pred_uncond', None)
                 if batch.audio_target is not None and audio_uncond is not None:
                     audio_target = batch.audio_target.float()
                     audio_uncond = audio_uncond.float()
                     audio_dims = [1] * (audio_target.dim() - 1)
                     if self.train_config.do_guidance_loss_cfg_zero:
-                        batch_size = audio_target.shape[0]
                         a_pos_flat = audio_target.view(batch_size, -1)
                         a_neg_flat = audio_uncond.view(batch_size, -1)
                         a_dot = torch.sum(a_pos_flat * a_neg_flat, dim=1, keepdim=True)
                         a_squared_norm = torch.sum(a_neg_flat ** 2, dim=1, keepdim=True) + 1e-8
-                        audio_uncond = audio_uncond * (a_dot / a_squared_norm).view(-1, *audio_dims)
-
-                    audio_guidance_scale = self._guidance_loss_target_batch
-                    if isinstance(audio_guidance_scale, list):
-                        audio_guidance_scale = torch.tensor(audio_guidance_scale).to(
-                            audio_target.device, dtype=audio_target.dtype
+                        audio_uncond = audio_uncond * (
+                            a_dot / a_squared_norm
                         ).view(-1, *audio_dims)
 
-                    if self.train_config.guidance_loss_schedule == 'sigma':
-                        # audio streams can run on their own remapped sigma
-                        audio_sigma = getattr(batch, 'audio_sigma', None)
-                        if audio_sigma is None:
-                            audio_sigma = timesteps / 1000.0
-                        audio_sigma = audio_sigma.to(
-                            audio_target.device, dtype=audio_target.dtype
-                        ).view(-1, *audio_dims)
-                        audio_guidance_scale = 1.0 + (audio_guidance_scale - 1.0) * audio_sigma
-
+                    audio_scales = self._get_guidance_loss_scales(
+                        target=self._audio_guidance_loss_target_batch,
+                        timesteps=timesteps,
+                        batch=batch,
+                        stream='audio',
+                        device=audio_target.device,
+                        dtype=audio_target.dtype,
+                    )
+                    audio_guidance_loss_multiplier = guidance_loss_weights(
+                        audio_scales, self.train_config.guidance_loss_weighting
+                    )
+                    audio_guidance_scale = audio_scales.view(-1, *audio_dims)
                     batch.audio_target = (
-                        audio_uncond + audio_guidance_scale * (audio_target - audio_uncond)
+                        audio_uncond
+                        + audio_guidance_scale * (audio_target - audio_uncond)
                     ).to(batch.audio_target.dtype).detach()
 
             if self.train_config.do_differential_guidance:
@@ -886,6 +977,12 @@ class SDTrainer(BaseSDTrainProcess):
             
             # apply model specific loss scaling
             loss = self.sd.scale_loss(loss)
+
+            if guidance_loss_multiplier is not None:
+                guidance_weight = guidance_loss_multiplier.to(
+                    device=loss.device, dtype=loss.dtype
+                ).view(-1, *([1] * (loss.dim() - 1)))
+                loss = loss * guidance_weight
                 
             do_weighted_timesteps = False
             if self.sd.is_flow_matching:
@@ -981,7 +1078,19 @@ class SDTrainer(BaseSDTrainProcess):
         
         # check for audio loss
         if batch.audio_pred is not None and batch.audio_target is not None:
-            audio_loss = torch.nn.functional.mse_loss(batch.audio_pred.float(), batch.audio_target.float(), reduction="mean")
+            audio_loss = torch.nn.functional.mse_loss(
+                batch.audio_pred.float(),
+                batch.audio_target.float(),
+                reduction="none",
+            )
+            audio_loss = audio_loss.mean(
+                dim=tuple(range(1, audio_loss.dim()))
+            )
+            if audio_guidance_loss_multiplier is not None:
+                audio_loss = audio_loss * audio_guidance_loss_multiplier.to(
+                    device=audio_loss.device, dtype=audio_loss.dtype
+                )
+            audio_loss = audio_loss.mean()
             audio_loss = audio_loss * self.train_config.audio_loss_multiplier
             loss = loss + audio_loss
 
@@ -2016,6 +2125,21 @@ class SDTrainer(BaseSDTrainProcess):
                             self.train_config.guidance_loss_target[1]
                         ) for _ in range(batch_size)
                     ]
+
+                if self.train_config.do_guidance_loss:
+                    audio_target = self.train_config.audio_guidance_loss_target
+                    if isinstance(audio_target, list):
+                        batch_size = noisy_latents.shape[0]
+                        self._audio_guidance_loss_target_batch = [
+                            random.uniform(audio_target[0], audio_target[1])
+                            for _ in range(batch_size)
+                        ]
+                    elif audio_target is None:
+                        # Preserve the historical coupling when no separate audio
+                        # target was configured, including randomized video ranges.
+                        self._audio_guidance_loss_target_batch = (
+                            self._guidance_loss_target_batch
+                        )
 
                 self.before_unet_predict()
                 

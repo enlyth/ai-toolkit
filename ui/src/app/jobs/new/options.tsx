@@ -719,6 +719,9 @@ export const modelArchs: ModelArch[] = [
       'config.process[0].train.cache_text_embeddings': [true, false],
       'config.process[0].train.do_guidance_loss': [true, undefined],
       'config.process[0].train.guidance_loss_target': [4.0, undefined],
+      // H3's baked-in audio guidance is ~3 vs the video stream's 4-6; without
+      // this the audio target inherits the video scale and over-extrapolates.
+      'config.process[0].train.audio_guidance_loss_target': [3.0, undefined],
       'config.process[0].network.linear': [16, defaultLinearRank],
       'config.process[0].network.linear_alpha': [16, defaultLinearRank],
       'config.process[0].network.network_kwargs.ignore_if_contains': [['adaln_proj'], []],

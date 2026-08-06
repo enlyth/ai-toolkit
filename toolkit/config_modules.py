@@ -591,13 +591,39 @@ class TrainConfig:
         self.guidance_loss_target: Union[int, List[int, int]] = kwargs.get('guidance_loss_target', 3.0)
         self.do_guidance_loss_cfg_zero: bool = kwargs.get('do_guidance_loss_cfg_zero', False)
         # 'constant' uses guidance_loss_target as is. 'sigma' decays the target
-        # toward 1.0 as sigma falls (effective = 1 + (target - 1) * sigma) so the
-        # extrapolation never amplifies the unpredictable fresh-noise term at low
-        # sigma. Needed for guidance-distilled models with no guidance embedding.
+        # toward 1.0 as sigma falls (effective = 1 + (target - 1) * sigma).
+        # 'calibrated' interpolates w_video / w_audio values from a JSON file.
         self.guidance_loss_schedule: str = kwargs.get('guidance_loss_schedule', 'sigma')
+        self.guidance_loss_schedule_path: Optional[str] = kwargs.get(
+            'guidance_loss_schedule_path', None
+        )
+        # Optional named list inside the schedule JSON, e.g. image_fit or video_fit.
+        self.guidance_loss_schedule_curve: Optional[str] = kwargs.get(
+            'guidance_loss_schedule_curve', None
+        )
+        # Joint audio/video models generally have different baked-in CFG scales.
+        # None preserves the old behaviour by inheriting guidance_loss_target.
+        self.audio_guidance_loss_target = kwargs.get(
+            'audio_guidance_loss_target', None
+        )
+        # Extrapolated targets grow residuals by w. 'inverse' compensates the MSE
+        # gradient by 1/w; inverse_square also equalizes the raw loss magnitude.
+        self.guidance_loss_weighting: str = kwargs.get(
+            'guidance_loss_weighting', 'none'
+        )
         self.unconditional_prompt: str = kwargs.get('unconditional_prompt', '')
         if isinstance(self.guidance_loss_target, tuple):
             self.guidance_loss_target = list(self.guidance_loss_target)
+        if isinstance(self.audio_guidance_loss_target, tuple):
+            self.audio_guidance_loss_target = list(self.audio_guidance_loss_target)
+        if self.guidance_loss_schedule not in ('constant', 'sigma', 'calibrated'):
+            raise ValueError(
+                "guidance_loss_schedule must be one of: constant, sigma, calibrated"
+            )
+        if self.guidance_loss_weighting not in ('none', 'inverse', 'inverse_square'):
+            raise ValueError(
+                "guidance_loss_weighting must be one of: none, inverse, inverse_square"
+            )
 
         self.do_differential_guidance = kwargs.get('do_differential_guidance', False)
         self.differential_guidance_scale = kwargs.get('differential_guidance_scale', 3.0)

@@ -48,6 +48,7 @@ from toolkit.accelerator import unwrap_model
 from toolkit.advanced_prompt_embeds import AdvancedPromptEmbeds
 from toolkit.basic import flush
 from toolkit.config_modules import GenerateImageConfig, ModelConfig
+from toolkit.guidance_loss import inverse_flow_shift
 from toolkit.memory_management import MemoryManager
 from toolkit.metadata import get_meta_for_safetensors
 from toolkit.models.base_model import BaseModel
@@ -186,6 +187,23 @@ class MinimaxH3Model(BaseModel):
     @staticmethod
     def get_train_scheduler():
         return CustomFlowMatchEulerDiscreteScheduler(**scheduler_config)
+
+    def get_unconditional_prompt_kwargs(self) -> dict:
+        # No vision block is the true T2V/image unconditional condition. A black
+        # control image would add Qwen3-VL vision tokens and move the null anchor.
+        return {}
+
+    def get_guidance_loss_schedule_coordinate(
+        self,
+        timesteps: torch.Tensor,
+        batch=None,
+        stream: str = "video",
+    ) -> torch.Tensor:
+        # H3 calibration probes record both video and audio w against the same
+        # *unshifted video* sigma. Training timesteps carry the shift-12 video
+        # sigma, while the model remaps audio internally to shift 3.
+        shifted_sigma = timesteps.float().reshape(-1) / 1000.0
+        return inverse_flow_shift(shifted_sigma, packing.VIDEO_SIGMA_SHIFT)
 
     def get_bucket_divisibility(self):
         # 16x VAE spatial compression * 2x2 transformer patch

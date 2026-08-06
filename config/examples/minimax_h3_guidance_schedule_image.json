@@ -1,0 +1,11 @@
+{
+  "_comment": "Provisional MiniMax-H3 single-image CFG-recovery curve. It is smoothed from the full-BF16 image probes in MiniMax-H3/training/runs/calib/w_schedule.json. Recalibrate on the exact ai-toolkit checkpoint when possible; the default pruned int8 ConvRot checkpoint is not identical to the probe checkpoint.",
+  "points": [
+    { "base_sigma": 0.00, "w_video": 1.0, "w_audio": 1.0 },
+    { "base_sigma": 0.05, "w_video": 2.0, "w_audio": 1.5 },
+    { "base_sigma": 0.20, "w_video": 4.0, "w_audio": 3.0 },
+    { "base_sigma": 0.50, "w_video": 5.0, "w_audio": 3.0 },
+    { "base_sigma": 0.80, "w_video": 4.0, "w_audio": 3.0 },
+    { "base_sigma": 1.00, "w_video": 4.0, "w_audio": 3.0 }
+  ]
+}

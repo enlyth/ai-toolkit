@@ -328,6 +328,41 @@ class BaseModel:
     def get_prompt_embeds(self, prompt: str, control_images=None) -> PromptEmbeds:
         raise NotImplementedError(
             "get_prompt_embeds must be implemented in child classes")
+
+    def get_unconditional_prompt_kwargs(self) -> dict:
+        """Inputs used when caching the trainer's unconditional prompt.
+
+        Most edit models need a neutral image because their text encoder always
+        expects control input. Architectures where an absent control is meaningful
+        can override this and return an empty dict.
+        """
+        if not self.encode_control_in_text_embeddings:
+            return {}
+        control_image = torch.zeros(
+            (1, 3, 224, 224),
+            device=self.device_torch,
+            dtype=self.torch_dtype,
+        )
+        if self.has_multiple_control_images:
+            control_image = [control_image]
+        return {"control_images": control_image}
+
+    def get_guidance_loss_schedule_coordinate(
+        self,
+        timesteps: torch.Tensor,
+        batch=None,
+        stream: str = "video",
+    ) -> torch.Tensor:
+        """Coordinate used by a calibrated guidance-loss schedule.
+
+        The generic coordinate is the actual scheduler sigma. Joint models may
+        override it when their calibration was measured in another coordinate.
+        """
+        if stream == "audio" and batch is not None:
+            audio_sigma = getattr(batch, "audio_sigma", None)
+            if audio_sigma is not None:
+                return audio_sigma.float().reshape(-1).clamp(0.0, 1.0)
+        return (timesteps.float().reshape(-1) / 1000.0).clamp(0.0, 1.0)
         
     def get_model_has_grad(self):
         raise NotImplementedError(

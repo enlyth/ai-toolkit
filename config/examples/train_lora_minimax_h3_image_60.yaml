@@ -1,0 +1,154 @@
+# MiniMax-H3 single-image LoRA template for a localized facial feature.
+#
+# Dataset layout:
+#   C:/datasets/h3_feature/images/0001.jpg
+#   C:/datasets/h3_feature/images/0001.txt
+#   C:/datasets/h3_feature/masks/0001.png
+#
+# Captions should always include the rare trigger and explicitly name the
+# feature, for example:
+#   "portrait photo of a person with zqxfeature, a distinctive split eyebrow, soft daylight"
+# Masks should be soft-edged and cover the feature plus enough surrounding face
+# context to survive H3's effective 32x transformer downsampling.
+---
+job: extension
+config:
+  name: "h3_zqxfeature_r16_v1"
+  process:
+    - type: "sd_trainer"
+      training_folder: "output"
+      device: "cuda:0"
+      trigger_word: "zqxfeature"
+
+      network:
+        type: "lora"
+        linear: 16
+        linear_alpha: 16
+        network_kwargs:
+          # The released distillation/timestep behaviour is concentrated here.
+          # Excluding AdaLN also cuts a very large, easy-to-overfit LoRA branch.
+          ignore_if_contains:
+            - "adaln_proj"
+
+      save:
+        dtype: "float16"
+        save_every: 100
+        max_step_saves_to_keep: 12
+        push_to_hub: false
+
+      datasets:
+        - folder_path: "C:/datasets/h3_feature/images"
+          mask_path: "C:/datasets/h3_feature/masks"
+          caption_ext: "txt"
+          resolution: [768]
+          buckets: true
+          bucket_tolerance: 64
+          num_frames: 1
+          num_repeats: 1
+          cache_latents_to_disk: true
+          cache_text_embeddings: true
+
+          # Do not train H3's null branch through caption or token dropout.
+          caption_dropout_rate: 0.0
+          token_dropout_rate: 0.0
+          shuffle_tokens: false
+
+          # Crops and flips are risky for a small or asymmetric facial feature.
+          random_crop: false
+          random_scale: false
+          flip_x: false
+          flip_y: false
+
+          # A small floor keeps a little contextual concept loss outside the
+          # white mask; inverted_mask_prior below preserves the base elsewhere.
+          mask_min_value: 0.05
+
+      train:
+        batch_size: 1
+        steps: 1200
+        gradient_accumulation: 1
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        max_grad_norm: 1.0
+        dtype: "bf16"
+
+        optimizer: "adamw8bit"
+        # guidance_loss_weighting inverse already scales the loss by ~1/w
+        # (~0.2-0.25x over most of the shift-12 sigma range), so the LR stays at
+        # the ordinary 1e-4. Only drop it if weighting is set back to "none".
+        lr: 0.0001
+        optimizer_params:
+          weight_decay: 0.0001
+        lr_scheduler: "constant"
+
+        noise_scheduler: "flowmatch"
+        # H3 inference uses video flow shift 12. The generic sigmoid default
+        # greatly under-samples the high-noise semantic part of H3's trajectory.
+        # If the feature lands structurally but never crisps up, A/B this
+        # against "lognorm_blend" on the same seed — shift-12 under-samples the
+        # mid/low-sigma region where fine detail is refined.
+        timestep_type: "shift"
+        content_or_style: "balanced"
+
+        # CFG-recovery: frozen base null + w(sigma) * (flow target - base null).
+        do_guidance_loss: true
+        do_guidance_loss_cfg_zero: false
+        guidance_loss_target: 5.0
+        audio_guidance_loss_target: 3.0
+        guidance_loss_schedule: "calibrated"
+        guidance_loss_schedule_path: "config/examples/minimax_h3_guidance_schedule_image.json"
+        # 1/w keeps high-w targets from receiving a larger gradient solely due
+        # to extrapolation. Use "none" for a strict unweighted reproduction.
+        guidance_loss_weighting: "inverse"
+        unconditional_prompt: ""
+
+        prompt_dropout_prob: 0.0
+        cache_text_embeddings: true
+        unload_text_encoder: true
+
+        # Requires matching masks. This costs one extra frozen-base forward but
+        # is especially helpful for a feature confined to a small face region.
+        # The prior loss is deliberately NOT guidance-weighted, while the main
+        # loss runs at ~1/w under inverse weighting — this multiplier is chosen
+        # against that already-shrunk main loss (0.05 here ~= a 0.25 ratio).
+        # If guidance_loss_weighting is "none", raise it back toward 0.25.
+        inverted_mask_prior: true
+        inverted_mask_prior_multiplier: 0.05
+
+        ema_config:
+          use_ema: false
+
+      model:
+        name_or_path: "Comfy-Org/MiniMax-H3"
+        arch: "minimax_h3"
+        quantize: true
+        qtype: "convrot8"
+        quantize_te: true
+        qtype_te: "nvfp4"
+        low_vram: true
+        model_kwargs:
+          partition: "fl2va"
+
+      sample:
+        sampler: "flowmatch"
+        sample_every: 100
+        sample_start_step: 0
+        width: 768
+        height: 768
+        num_frames: 1
+        fps: 24
+        prompts:
+          - "close portrait photo of a person with [trigger], a distinctive split eyebrow, neutral studio light"
+          - "head-and-shoulders photo of a different person with [trigger], a distinctive split eyebrow, outdoors"
+          - "medium shot of a person with [trigger], a distinctive split eyebrow, cinematic lighting"
+          - "close portrait photo of a person, normal eyebrows, neutral studio light"
+        neg: ""
+        seed: 42
+        walk_seed: false
+        guidance_scale: 1.0
+        sample_steps: 28
+
+meta:
+  name: "[name]"
+  version: "1.0"
