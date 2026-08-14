@@ -25,6 +25,7 @@ from toolkit.guidance_loss import (
 from toolkit.image_utils import show_tensors, show_latents
 from toolkit.ip_adapter import IPAdapter
 from toolkit.custom_adapter import CustomAdapter
+from toolkit.memory_management import sync_grad_transfers
 from toolkit.print import print_acc
 from toolkit.prompt_utils import PromptEmbeds, concat_prompt_embeds
 from toolkit.reference_adapter import ReferenceAdapter
@@ -85,12 +86,19 @@ class SDTrainer(BaseSDTrainProcess):
         self.cached_blank_embeds: Optional[PromptEmbeds] = None
         self.cached_trigger_embeds: Optional[PromptEmbeds] = None
         self.diff_output_preservation_embeds: Optional[PromptEmbeds] = None
+        # fallback class-only embeds for when the text encoder is unloaded and
+        # per item DOP embeds were not cached to disk
+        self.cached_dop_class_embeds: Optional[PromptEmbeds] = None
         
         self.dfe: Optional[DiffusionFeatureExtractor] = None
         self.unconditional_embeds = None
         
         if self.train_config.diff_output_preservation:
-            if self.trigger_word is None:
+            # datasets can have their own trigger words, the global one is copied to them if not set
+            has_dataset_trigger = any(
+                dataset.trigger_word is not None for dataset in self.dataset_configs
+            )
+            if self.trigger_word is None and not has_dataset_trigger:
                 raise ValueError("diff_output_preservation requires a trigger_word to be set")
             if self.network_config is None:
                 raise ValueError("diff_output_preservation requires a network to be set")
@@ -195,6 +203,29 @@ class SDTrainer(BaseSDTrainProcess):
 
     def before_model_load(self):
         pass
+
+    def get_blank_control_image(self):
+        # noise instead of a black image so the fallback does not read as a
+        # meaningful (solid black) reference
+        control_image = torch.rand((1, 3, 224, 224), device=self.sd.device_torch, dtype=self.sd.torch_dtype)
+        if self.sd.has_multiple_control_images:
+            control_image = [control_image]
+        return control_image
+
+    def encode_static_prompt(self, prompt, **kwargs):
+        # static embeds (blank/trigger/uncond/DOP class) are always plain text.
+        # Models that need control input to encode say what a neutral one is.
+        # Otherwise, some models (edit models) cannot encode a prompt without
+        # control images and raise, only then fall back to a blank control image.
+        # Real errors surface on the fallback call.
+        if hasattr(self.sd, 'get_unconditional_prompt_kwargs'):
+            kwargs = {**self.sd.get_unconditional_prompt_kwargs(), **kwargs}
+        try:
+            return self.sd.encode_prompt(prompt, **kwargs)
+        except Exception:
+            if 'control_images' in kwargs:
+                raise
+            return self.sd.encode_prompt(prompt, control_images=self.get_blank_control_image(), **kwargs)
     
     def cache_sample_prompts(self):
         if self.train_config.disable_sampling:
@@ -334,23 +365,9 @@ class SDTrainer(BaseSDTrainProcess):
         
         # cache unconditional embeds (blank prompt)
         with torch.no_grad():
-            if hasattr(self.sd, 'get_unconditional_prompt_kwargs'):
-                kwargs = self.sd.get_unconditional_prompt_kwargs()
-            else:
-                kwargs = {}
-                if self.sd.encode_control_in_text_embeddings:
-                    control_image = torch.zeros(
-                        (1, 3, 224, 224),
-                        device=self.sd.device_torch,
-                        dtype=self.sd.torch_dtype,
-                    )
-                    if self.sd.has_multiple_control_images:
-                        control_image = [control_image]
-                    kwargs['control_images'] = control_image
-            self.unconditional_embeds = self.sd.encode_prompt(
+            self.unconditional_embeds = self.encode_static_prompt(
                 [self.train_config.unconditional_prompt],
                 long_prompts=self.do_long_prompts,
-                **kwargs
             ).to(
                 self.device_torch,
                 dtype=self.sd.torch_dtype
@@ -404,24 +421,12 @@ class SDTrainer(BaseSDTrainProcess):
                     raise ValueError("Cannot unload text encoder if training text encoder")
                 # cache embeddings
                 self.sd.text_encoder_to(self.device_torch)
-                if hasattr(self.sd, 'get_unconditional_prompt_kwargs'):
-                    encode_kwargs = self.sd.get_unconditional_prompt_kwargs()
-                else:
-                    encode_kwargs = {}
-                    if self.sd.encode_control_in_text_embeddings:
-                        control_image = torch.zeros(
-                            (1, 3, 224, 224),
-                            device=self.sd.device_torch,
-                            dtype=self.sd.torch_dtype,
-                        )
-                        if self.sd.has_multiple_control_images:
-                            control_image = [control_image]
-                        encode_kwargs['control_images'] = control_image
-                self.cached_blank_embeds = self.sd.encode_prompt("", **encode_kwargs)
+                self.cached_blank_embeds = self.encode_static_prompt("")
                 if self.trigger_word is not None:
-                    self.cached_trigger_embeds = self.sd.encode_prompt(self.trigger_word, **encode_kwargs)
+                    self.cached_trigger_embeds = self.encode_static_prompt(self.trigger_word)
                 if self.train_config.diff_output_preservation:
-                    self.diff_output_preservation_embeds = self.sd.encode_prompt(self.train_config.diff_output_preservation_class)
+                    self.cached_dop_class_embeds = self.encode_static_prompt(self.train_config.diff_output_preservation_class)
+                    self.diff_output_preservation_embeds = self.cached_dop_class_embeds
                 
                 self.cache_sample_prompts()
                 
@@ -1036,7 +1041,7 @@ class SDTrainer(BaseSDTrainProcess):
                 prior_loss = torch.nn.functional.mse_loss(pred.float(), prior_pred.float(), reduction="none")
 
             prior_loss = prior_loss * prior_mask_multiplier * self.train_config.inverted_mask_prior_multiplier
-            if torch.isnan(prior_loss).any() or not torch.isfinite(prior_loss):
+            if not torch.isfinite(prior_loss).all():
                 print_acc("Prior loss is nan")
                 prior_loss = None
             else:
@@ -1092,6 +1097,8 @@ class SDTrainer(BaseSDTrainProcess):
                 )
             audio_loss = audio_loss.mean()
             audio_loss = audio_loss * self.train_config.audio_loss_multiplier
+            self.additional_logs['loss/img'] = loss.item()
+            self.additional_logs['loss/audio'] = audio_loss.item()
             loss = loss + audio_loss
 
         # check for additional losses
@@ -1768,6 +1775,16 @@ class SDTrainer(BaseSDTrainProcess):
                                     [unconditional_embeds] * noisy_latents.shape[0]
                                 )
 
+                            if self.train_config.diff_output_preservation:
+                                if batch.dop_prompt_embeds is not None:
+                                    # cached to disk with the trigger word replaced per dataset
+                                    self.diff_output_preservation_embeds = batch.dop_prompt_embeds.clone().detach().to(
+                                        self.device_torch, dtype=dtype
+                                    )
+                                else:
+                                    # no per item cache, fall back to the class only embeds
+                                    self.diff_output_preservation_embeds = self.cached_dop_class_embeds
+
                             if isinstance(self.adapter, CustomAdapter):
                                 self.adapter.is_unconditional_run = False
 
@@ -1834,10 +1851,16 @@ class SDTrainer(BaseSDTrainProcess):
                                     self.adapter.is_unconditional_run = False
                             
                             if self.train_config.diff_output_preservation:
-                                dop_prompts = [p.replace(self.trigger_word, self.train_config.diff_output_preservation_class) for p in conditioned_prompts]
+                                # datasets can have their own trigger words, replace per item
+                                def replace_trigger_with_class(prompt, file_item):
+                                    trigger = file_item.trigger_word if file_item.trigger_word is not None else self.trigger_word
+                                    if trigger is None:
+                                        return prompt
+                                    return prompt.replace(trigger, self.train_config.diff_output_preservation_class)
+                                dop_prompts = [replace_trigger_with_class(p, fi) for p, fi in zip(conditioned_prompts, batch.file_items)]
                                 dop_prompts_2 = None
                                 if prompt_2 is not None:
-                                    dop_prompts_2 = [p.replace(self.trigger_word, self.train_config.diff_output_preservation_class) for p in prompt_2]
+                                    dop_prompts_2 = [replace_trigger_with_class(p, fi) for p, fi in zip(prompt_2, batch.file_items)]
                                 self.diff_output_preservation_embeds = self.sd.encode_prompt(
                                     dop_prompts, dop_prompts_2,
                                     dropout_prob=self.train_config.prompt_dropout_prob,
@@ -2009,6 +2032,33 @@ class SDTrainer(BaseSDTrainProcess):
                     else:
                         self.adapter.set_reference_images(None)
 
+                if self.train_config.do_guidance_loss and isinstance(self.train_config.guidance_loss_target, list):
+                    batch_size = noisy_latents.shape[0]
+                    # update the guidance value, random float between guidance_loss_target[0] and guidance_loss_target[1]
+                    # sample before the prior prediction so the prior, main, uncond, and
+                    # preservation passes all run at the same guidance values
+                    self._guidance_loss_target_batch = [
+                        random.uniform(
+                            self.train_config.guidance_loss_target[0],
+                            self.train_config.guidance_loss_target[1]
+                        ) for _ in range(batch_size)
+                    ]
+
+                if self.train_config.do_guidance_loss:
+                    audio_target = self.train_config.audio_guidance_loss_target
+                    if isinstance(audio_target, list):
+                        batch_size = noisy_latents.shape[0]
+                        self._audio_guidance_loss_target_batch = [
+                            random.uniform(audio_target[0], audio_target[1])
+                            for _ in range(batch_size)
+                        ]
+                    elif audio_target is None:
+                        # Preserve the historical coupling when no separate audio
+                        # target was configured, including randomized video ranges.
+                        self._audio_guidance_loss_target_batch = (
+                            self._guidance_loss_target_batch
+                        )
+
                 prior_pred = None
 
                 do_inverted_masked_prior = False
@@ -2116,31 +2166,6 @@ class SDTrainer(BaseSDTrainProcess):
                                 pred_kwargs['down_block_additional_residuals'] = down_block_res_samples
                                 pred_kwargs['mid_block_additional_residual'] = mid_block_res_sample
                 
-                if self.train_config.do_guidance_loss and isinstance(self.train_config.guidance_loss_target, list):
-                    batch_size = noisy_latents.shape[0]
-                    # update the guidance value, random float between guidance_loss_target[0] and guidance_loss_target[1]
-                    self._guidance_loss_target_batch = [
-                        random.uniform(
-                            self.train_config.guidance_loss_target[0],
-                            self.train_config.guidance_loss_target[1]
-                        ) for _ in range(batch_size)
-                    ]
-
-                if self.train_config.do_guidance_loss:
-                    audio_target = self.train_config.audio_guidance_loss_target
-                    if isinstance(audio_target, list):
-                        batch_size = noisy_latents.shape[0]
-                        self._audio_guidance_loss_target_batch = [
-                            random.uniform(audio_target[0], audio_target[1])
-                            for _ in range(batch_size)
-                        ]
-                    elif audio_target is None:
-                        # Preserve the historical coupling when no separate audio
-                        # target was configured, including randomized video ranges.
-                        self._audio_guidance_loss_target_batch = (
-                            self._guidance_loss_target_batch
-                        )
-
                 self.before_unet_predict()
                 
                 if unconditional_embeds is not None:
@@ -2342,6 +2367,9 @@ class SDTrainer(BaseSDTrainProcess):
 
 
         if not self.is_grad_accumulation_step:
+            # grads of memory-managed (offloaded) params are async D2H copies into
+            # pinned tensors; join them before anything on the CPU reads .grad
+            sync_grad_transfers()
             # fix this for multi params
             if self.train_config.optimizer != 'adafactor':
                 if isinstance(self.params[0], dict):

@@ -591,9 +591,11 @@ class TrainConfig:
         self.guidance_loss_target: Union[int, List[int, int]] = kwargs.get('guidance_loss_target', 3.0)
         self.do_guidance_loss_cfg_zero: bool = kwargs.get('do_guidance_loss_cfg_zero', False)
         # 'constant' uses guidance_loss_target as is. 'sigma' decays the target
-        # toward 1.0 as sigma falls (effective = 1 + (target - 1) * sigma).
+        # toward 1.0 as sigma falls (effective = 1 + (target - 1) * sigma) so the
+        # extrapolation never amplifies the unpredictable fresh-noise term at low
+        # sigma. Needed for guidance-distilled models with no guidance embedding.
         # 'calibrated' interpolates w_video / w_audio values from a JSON file.
-        self.guidance_loss_schedule: str = kwargs.get('guidance_loss_schedule', 'sigma')
+        self.guidance_loss_schedule: str = kwargs.get('guidance_loss_schedule', 'constant')
         self.guidance_loss_schedule_path: Optional[str] = kwargs.get(
             'guidance_loss_schedule_path', None
         )
@@ -950,6 +952,10 @@ class DatasetConfig:
         self.default_caption: str = kwargs.get('default_caption', None)
         # trigger word for just this dataset
         self.trigger_word: str = kwargs.get('trigger_word', None)
+        # set automatically from the train config when diff output preservation is enabled.
+        # the dataset trigger word is replaced with the class in the caption for DOP embeddings
+        self.diff_output_preservation: bool = kwargs.get('diff_output_preservation', False)
+        self.diff_output_preservation_class: str = kwargs.get('diff_output_preservation_class', '')
         random_triggers = kwargs.get('random_triggers', [])
         # if they are a string, load them from a file
         if isinstance(random_triggers, str) and os.path.exists(random_triggers):
@@ -1090,6 +1096,11 @@ class DatasetConfig:
         # Important, make sure fps for dataset is set correctly.
         # this wont work with bucketing for now until I can handle this before bucketing.
         self.auto_frame_count: bool = kwargs.get('auto_frame_count', False)
+        
+        #  old behavior shrank the video to fit the temporal spacing of the model. Which fits the whole video, but
+        # can lead to fast motion/chipmunking. This will prevent the video from shrinking to fit, and instead, trim
+        # the tail of the video. Usually only a few frames. 
+        self.trim_auto_frame_count_tail: bool = kwargs.get('trim_auto_frame_count_tail', True)
         
         # debug the frame count and frame selection. You dont need this. It is for debugging.
         self.debug: bool = kwargs.get('debug', False)
@@ -1520,11 +1531,6 @@ def validate_configs(
     # see if any datasets are caching text embeddings
     is_caching_text_embeddings = any(dataset.cache_text_embeddings for dataset in dataset_configs)
     if is_caching_text_embeddings:
-        
-        # check if they are doing differential output preservation
-        if train_config.diff_output_preservation:
-            raise ValueError("Cannot use differential output preservation with caching text embeddings. Please set diff_output_preservation to False.")
-    
         # make sure they are all cached
         for dataset in dataset_configs:
             if not dataset.cache_text_embeddings:

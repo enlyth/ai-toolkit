@@ -324,6 +324,16 @@ export default function SimpleJob({
                 placeholder=""
               />
             )}
+            {modelArch?.customModelSelectOptions?.map(customOption => (
+              <SelectInput
+                key={customOption.label}
+                label={customOption.label}
+                value={customOption.getValue(jobConfig) ?? ''}
+                doc={customOption.doc}
+                onChange={value => customOption.onChange(value, jobConfig, setJobConfig)}
+                options={customOption.options}
+              />
+            ))}
             {modelArch?.modelNotes && (
               <div className="pt-2">
                 <button
@@ -1233,6 +1243,7 @@ export default function SimpleJob({
                       <NumberInput
                         label="Caption Dropout Rate"
                         className="pt-2"
+                        docKey="datasets.caption_dropout_rate"
                         value={dataset.caption_dropout_rate}
                         onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].caption_dropout_rate`)}
                         placeholder="eg. 0.05"
@@ -1368,33 +1379,6 @@ export default function SimpleJob({
                         </FormGroup>
                       )}
                     </div>
-                    <div>
-                      <FormGroup label="Resolutions" className="pt-2">
-                        <div className="grid grid-cols-2 gap-2">
-                          {[
-                            [256, 512, 768, 1024],
-                            [1280, 1328, 1536],
-                          ].map(resGroup => (
-                            <div key={resGroup[0]} className="space-y-2">
-                              {resGroup.map(res => (
-                                <Checkbox
-                                  key={res}
-                                  disabled={dataset.preserve_resolutions}
-                                  label={res.toString()}
-                                  checked={dataset.resolution.includes(res)}
-                                  onChange={value => {
-                                    const resolutions = dataset.resolution.includes(res)
-                                      ? dataset.resolution.filter(r => r !== res)
-                                      : [...dataset.resolution, res];
-                                    setJobConfig(resolutions, `config.process[0].datasets[${i}].resolution`);
-                                  }}
-                                />
-                              ))}
-                            </div>
-                          ))}
-                        </div>
-                      </FormGroup>
-                    </div>
                     {!isAudioModel && (
                       <div>
                         <FormGroup label="Resolutions" className="pt-2">
@@ -1407,6 +1391,7 @@ export default function SimpleJob({
                                 {resGroup.map(res => (
                                   <Checkbox
                                     key={res}
+                                    disabled={dataset.preserve_resolutions}
                                     label={res.toString()}
                                     checked={dataset.resolution.includes(res)}
                                     onChange={value => {

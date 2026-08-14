@@ -431,9 +431,14 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                 # only look for audio files
                 extensions = audio_extensions
             elif self.is_video:
-                # only look for videos
-                extensions = video_extensions
-            file_list = [os.path.join(root, file) for root, _, files in os.walk(self.dataset_path) for file in files if file.lower().endswith(tuple(extensions)) and not file.startswith('.')]
+                # look for videos and images. Video models can train on both;
+                # images are bucketed separately as single-frame items
+                extensions = video_extensions + image_extensions
+            # prune hidden dirs (.thumbs, .tmp) so their contents never train
+            file_list = []
+            for root, dirs, files in os.walk(self.dataset_path):
+                dirs[:] = [d for d in dirs if not d.startswith('.')]
+                file_list.extend(os.path.join(root, file) for file in files if file.lower().endswith(tuple(extensions)) and not file.startswith('.'))
         else:
             # assume json
             with open(self.dataset_path, 'r') as f:
@@ -555,7 +560,12 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             json.dump(self.size_database, f)
         
         if self.is_video:
-            print_acc(f"  -  Found {len(self.file_list)} videos")
+            num_videos = len([x for x in self.file_list if x.is_video])
+            num_images = len(self.file_list) - num_videos
+            if num_images > 0:
+                print_acc(f"  -  Found {num_videos} videos and {num_images} images")
+            else:
+                print_acc(f"  -  Found {num_videos} videos")
             assert len(self.file_list) > 0, f"no videos found in {self.dataset_path}"
         else:
             print_acc(f"  -  Found {len(self.file_list)} images")
